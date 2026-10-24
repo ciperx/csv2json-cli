@@ -1,0 +1,405 @@
+openapi: 3.0.3
+info:
+  title: CSV ↔ JSON Conversion API
+  version: 1.0.0
+  description: |
+    Stateless conversion service that wraps the `csv2json-cli` converters.
+    It turns delimited text (CSV/TSV) into typed JSON and flat JSON arrays into
+    RFC 4180 CSV. Every response is deterministic: identical input yields an
+    identical body, and no state is kept between requests.
+
+    **Design notes**
+    * Streaming-safe: payloads up to 50 MB are accepted; larger bodies are rejected
+      with `413 payload_too_large` *before* parsing.
+    * Type inference is opt-in (`infer_types=true`, default). Disable it to keep every
+      value as a string.
+    * Error responses always use the same envelope (`Error`) so clients can branch on
+      `error.code` instead of string matching.
+  termsOfService: https://github.com/ciperx/csv2json-cli
+  license:
+    name: MIT
+    url: https://github.com/ciperx/csv2json-cli/blob/main/LICENSE
+  contact:
+    name: csv2json-cli maintainers
+    url: https://github.com/ciperx/csv2json-cli/issues
+servers:
+  - url: https://convert.example.com/v1
+    description: Production
+  - url: http://localhost:8080/v1
+    description: Local development
+
+tags:
+  - name: convert
+    description: Conversion endpoints
+  - name: meta
+    description: Health and capability discovery
+
+paths:
+  /health:
+    get:
+      tags: [meta]
+      operationId: getHealth
+      summary: Liveness probe
+      description: Returns service status and the engine version. Never requires auth.
+      responses:
+        '200':
+          description: Service is up
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+              example:
+                status: ok
+                version: 1.0.0
+                uptimeSeconds: 4213
+
+  /capabilities:
+    get:
+      tags: [meta]
+      operationId: getCapabilities
+      summary: List supported delimiters, encodings and limits
+      responses:
+        '200':
+          description: Capability document
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Capabilities'
+              example:
+                delimiters: [",", ";", "\t", "|"]
+                encodings: [utf-8, utf-8-sig, latin-1]
+                maxPayloadBytes: 52428800
+                inferTypes: true
+
+  /convert/csv-to-json:
+    post:
+      tags: [convert]
+      operationId: convertCsvToJson
+      summary: Convert delimited text to a JSON array
+      description: |
+        Parses `text/csv` (or any single-character delimiter) and returns a JSON array
+        of objects keyed by the header row. When two header cells collide, the second
+        occurrence is suffixed `_2`, `_3`, … so no column is silently dropped.
+
+        With `infer_types=true` the converter maps `true`/`false` to booleans, integer
+        and decimal literals to numbers, empty cells to `null`, and leaves everything
+        else as a string. Dates are **not** coerced — keep them as strings to avoid
+        timezone ambiguity.
+      requestBody:
+        required: true
+        content:
+          text/csv:
+            schema:
+              type: string
+              format: binary
+            example: |
+              id,name,active,score
+              1,Ada,true,9.5
+              2,Grace,false,
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CsvToJsonRequest'
+            example:
+              delimiter: ";"
+              infer_types: true
+              data: "id;name\n1;Ada\n2;Grace"
+      parameters:
+        - $ref: '#/components/parameters/Delimiter'
+        - $ref: '#/components/parameters/InferTypes'
+      responses:
+        '200':
+          description: Conversion succeeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CsvToJsonResponse'
+              example:
+                rows:
+                  - id: 1
+                    name: Ada
+                    active: true
+                    score: 9.5
+                  - id: 2
+                    name: Grace
+                    active: false
+                    score: null
+                rowCount: 2
+                columns: [id, name, active, score]
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '422':
+          $ref: '#/components/responses/UnprocessableCsv'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /convert/json-to-csv:
+    post:
+      tags: [convert]
+      operationId: convertJsonToCsv
+      summary: Convert an array of flat JSON objects to CSV
+      description: |
+        The header is the union of all keys, in first-seen order. A key missing from a
+        particular object is emitted as an empty cell (never `null`, never omitted), so
+        the output width is constant. Nested objects and arrays are rejected with
+        `400 nested_value` unless `flatten=true`, in which case they are flattened with
+        dot notation (`address.city`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JsonToCsvRequest'
+            example:
+              delimiter: ","
+              include_header: true
+              flatten: true
+              rows:
+                - id: 1
+                  name: Ada
+                  address: {city: London}
+                - id: 2
+                  name: Grace
+      parameters:
+        - $ref: '#/components/parameters/Delimiter'
+      responses:
+        '200':
+          description: CSV document
+          headers:
+            Content-Disposition:
+              description: Suggested filename, e.g. `attachment; filename="converted.csv"`
+              schema:
+                type: string
+          content:
+            text/csv:
+              schema:
+                type: string
+              example: |
+                id,name,address.city
+                1,Ada,London
+                2,Grace,
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '422':
+          $ref: '#/components/responses/UnprocessableCsv'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+components:
+  parameters:
+    Delimiter:
+      name: delimiter
+      in: query
+      required: false
+      description: Field separator. Must be a single character. Defaults to `,`.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 1
+        default: ','
+      example: ";"
+    InferTypes:
+      name: infer_types
+      in: query
+      required: false
+      description: Coerce booleans, numbers and empty cells. Set `false` for all-strings output.
+      schema:
+        type: boolean
+        default: true
+
+  responses:
+    BadRequest:
+      description: Malformed request (bad delimiter, nested value without flatten, empty rows)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: invalid_delimiter
+              message: "delimiter must be exactly one character, got 3"
+              field: delimiter
+    PayloadTooLarge:
+      description: Body exceeds the 50 MB limit
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: payload_too_large
+              message: "payload is 73400320 bytes, limit is 52428800"
+    UnsupportedMediaType:
+      description: Content-Type is not `text/csv` or `application/json`
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: unsupported_media_type
+              message: "expected text/csv or application/json, got application/xml"
+    UnprocessableCsv:
+      description: The payload parsed as bytes but is not valid CSV/JSON (ragged rows, bad quotes, invalid JSON)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: ragged_row
+              message: "row 4 has 3 fields, header has 4"
+              line: 4
+    TooManyRequests:
+      description: Rate limit exceeded (60 requests/minute per IP)
+      headers:
+        Retry-After:
+          description: Seconds to wait before retrying
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: rate_limited
+              message: "60 requests/minute exceeded, retry in 12s"
+    InternalError:
+      description: Unexpected server error; safe to retry with backoff
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: internal_error
+              message: "conversion failed, request id 8f2c1a"
+
+  schemas:
+    Health:
+      type: object
+      required: [status, version]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+        version:
+          type: string
+          example: 1.0.0
+        uptimeSeconds:
+          type: integer
+          minimum: 0
+
+    Capabilities:
+      type: object
+      required: [delimiters, encodings, maxPayloadBytes]
+      properties:
+        delimiters:
+          type: array
+          items:
+            type: string
+        encodings:
+          type: array
+          items:
+            type: string
+        maxPayloadBytes:
+          type: integer
+          example: 52428800
+        inferTypes:
+          type: boolean
+
+    CsvToJsonRequest:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: string
+          description: Raw delimited text
+        delimiter:
+          type: string
+          minLength: 1
+          maxLength: 1
+          default: ','
+        infer_types:
+          type: boolean
+          default: true
+
+    CsvToJsonResponse:
+      type: object
+      required: [rows, rowCount, columns]
+      properties:
+        rows:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        rowCount:
+          type: integer
+          minimum: 0
+        columns:
+          type: array
+          items:
+            type: string
+
+    JsonToCsvRequest:
+      type: object
+      required: [rows]
+      properties:
+        rows:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        delimiter:
+          type: string
+          minLength: 1
+          maxLength: 1
+          default: ','
+        include_header:
+          type: boolean
+          default: true
+        flatten:
+          type: boolean
+          default: false
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: Stable machine-readable identifier
+              enum:
+                - invalid_delimiter
+                - nested_value
+                - empty_rows
+                - payload_too_large
+                - unsupported_media_type
+                - ragged_row
+                - invalid_json
+                - unclosed_quote
+                - rate_limited
+                - internal_error
+            message:
+              type: string
+              description: Human-readable detail; may change between releases
+            field:
+              type: string
+              description: Name of the offending request field, when applicable
+            line:
+              type: integer
+              description: 1-based line number of the offending row, when applicable
